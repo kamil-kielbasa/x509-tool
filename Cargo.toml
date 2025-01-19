@@ -1,0 +1,12 @@
+[package]
+name = "x509_tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+asn1-rs = "0.6.2"
+clap = { version = "4.5.26", features = ["cargo"] }
+convert_case = "0.7.1"
+oid-registry = "0.7.1"
+sha2 = "0.10.8"
+x509-parser = "=0.16.0"
