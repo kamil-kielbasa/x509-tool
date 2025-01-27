@@ -16,7 +16,7 @@ Usage: x509_tool <COMMAND>
 
 Commands:
   parse   Parse and print given certificate
-  render  Render given certificate to C-header
+  render  Render given certificate or private key to C-header
   help    Print this message or the help of the given subcommand(s)
 
 Options:
