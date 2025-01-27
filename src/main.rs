@@ -1,15 +1,33 @@
-use asn1_rs::{oid, Any, FromDer, Sequence, ToDer};
+use asn1_rs::{oid, Any, Class, FromDer, Result, Sequence, Tag, ToDer};
 use clap::{Arg, Command};
 use convert_case::{Case, Casing};
 use oid_registry::OidRegistry;
+use pem::parse;
+use pkcs8::{ObjectIdentifier, PrivateKeyInfo};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Error, ErrorKind, Write};
+use std::marker::PhantomData;
 use std::path::Path;
 use x509_parser::parse_x509_certificate;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::{ParsedExtension, X509Certificate};
 use x509_parser::public_key::PublicKey;
+
+struct Context<'a> {
+    // oid_registry: OidRegistry<'a>,
+    filename: &'a str,
+    t: PhantomData<&'a ()>,
+}
+
+impl<'a> Default for Context<'a> {
+    fn default() -> Self {
+        Context {
+            filename: "filename.h",
+            t: PhantomData,
+        }
+    }
+}
 
 fn main() -> std::io::Result<()> {
     let about = format!(
@@ -39,11 +57,18 @@ fn main() -> std::io::Result<()> {
             Command::new("render")
                 .about("render given certificate to C-header")
                 .arg(
-                    Arg::new("path")
-                        .short('p')
-                        .long("path")
-                        .required(true)
+                    Arg::new("cert")
+                        .short('c')
+                        .long("cert")
+                        .required(false)
                         .help("Provides a path to certificate"),
+                )
+                .arg(
+                    Arg::new("key")
+                        .short('k')
+                        .long("key")
+                        .required(false)
+                        .help("Provides a path to certificate private key"),
                 ),
         )
         .get_matches();
@@ -62,7 +87,7 @@ fn main() -> std::io::Result<()> {
             Ok(())
         }
         Some(("render", sub_matches)) => {
-            let cert_path = Path::new(sub_matches.get_one::<String>("path").unwrap());
+            let cert_path = Path::new(sub_matches.get_one::<String>("cert").unwrap());
             let cert = fs::read(cert_path).expect("Could not read certificate");
 
             let cert_name = cert_path
@@ -83,6 +108,21 @@ fn main() -> std::io::Result<()> {
             let tbs_buf = &seq_1.content[..tbs_len];
 
             write_x509_info(&cert_name, &x509, &pem.contents, &tbs_buf);
+
+            let key_path = Path::new(sub_matches.get_one::<String>("key").unwrap());
+            let key = fs::read(key_path).expect("Could not read certificate private key");
+            let pem = parse(key).unwrap();
+            let pk = PrivateKeyInfo::try_from(pem.contents()).unwrap();
+
+            let key_name = key_path
+                .file_name()
+                .expect("File name parse error")
+                .to_str()
+                .unwrap();
+            let dot_idx = key_name.chars().position(|c| c == '.').unwrap();
+            let key_name = &key_name[..dot_idx].replace("-", "_");
+
+            write_priv_key_info(key_name, &pk);
 
             Ok(())
         }
@@ -114,6 +154,121 @@ fn write_array(file: &mut File, file_name: &str, buffer: &[u8], name: &str) {
     file.write_all(b"\n").unwrap();
 }
 
+fn print_der_result_any(r: Result<Any>, depth: usize, ctx: &Context) {
+    match r {
+        Ok(any) => print_der_any(any, depth, ctx),
+        Err(e) => {
+            eprintln!("Error while parsing at depth {}: {:?}", depth, e);
+        }
+    }
+}
+
+fn print_der_any(any: Any, depth: usize, ctx: &Context) {
+    match any.header.class() {
+        Class::Universal => (),
+        Class::ContextSpecific | Class::Application => {
+            // attempt to decode inner object (if EXPLICIT)
+            match Any::from_der(any.data) {
+                Ok((_, inner)) => {
+                    print_der_any(inner, depth + 2, ctx);
+                }
+                Err(_) => panic!("Panicked!!!"),
+            }
+            return;
+        }
+        _ => {
+            return;
+        }
+    }
+    match any.header.tag() {
+        Tag::BitString => {
+            let b = any.bitstring().unwrap();
+
+            let new_line_fmt = format!("\n");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(format!("{0}.h", ctx.filename))
+                .unwrap();
+
+            let cert_fmt = format!("/* Certificate private key. */\n");
+            file.write(cert_fmt.as_bytes()).unwrap();
+            write_array(&mut file, ctx.filename, &b.as_ref()[1..], "priv_key");
+            file.write(new_line_fmt.as_bytes()).unwrap();
+
+            let header_name_fmt =
+                format!("{}_H", ctx.filename.to_case(Case::Upper).replace(" ", "_"));
+            let include_guard_fmt = format!("#endif /* {header_name_fmt} */\n");
+            file.write(include_guard_fmt.as_bytes()).unwrap();
+        }
+        Tag::Integer => {}
+        Tag::OctetString => {}
+        Tag::Oid => {
+            let oid = any.oid().unwrap();
+
+            let new_line_fmt = format!("\n");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(format!("{0}.h", ctx.filename))
+                .unwrap();
+
+            if oid!(1.2.840 .10045 .3 .1 .7) == oid {
+                let priv_key_alg_family_fmt = format!("const psa_key_type_t {0}_priv_key_alg_family = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1);\n", ctx.filename);
+                file.write(priv_key_alg_family_fmt.as_bytes()).unwrap();
+                file.write(new_line_fmt.as_bytes()).unwrap();
+            }
+        }
+        Tag::Sequence => {
+            let seq = any.sequence().unwrap();
+            for item in seq.der_iter::<Any, asn1_rs::Error>() {
+                print_der_result_any(item, depth + 1, ctx);
+            }
+        }
+        _ => unimplemented!("unsupported tag {}", any.header.tag()),
+    }
+}
+
+fn write_priv_key_info(key_name: &str, priv_key_info: &PrivateKeyInfo) {
+    let mut ctx = Context::default();
+    ctx.filename = key_name;
+
+    let mut file = File::create(format!("{key_name}.h")).unwrap();
+
+    let header_name_fmt = format!("{}_H", key_name.to_case(Case::Upper).replace(" ", "_"));
+    let include_guard_fmt = format!(
+        "#ifndef {header_name_fmt}\n\
+         #define {header_name_fmt}\n\n"
+    );
+    file.write(include_guard_fmt.as_bytes()).unwrap();
+
+    let includes_fmt = format!(
+        "#include <stdint.h>\n\
+         #include <psa/crypto.h>\n\n"
+    );
+    file.write(includes_fmt.as_bytes()).unwrap();
+
+    let exp_oid = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    if exp_oid == priv_key_info.algorithm.oid {
+        let new_line_fmt = format!("\n");
+        let pub_key_fmt = format!("/* Private Key Info - Algorithm. */");
+        file.write(pub_key_fmt.as_bytes()).unwrap();
+        file.write(new_line_fmt.as_bytes()).unwrap();
+        let pub_key_alg_fmt = format!(
+            "const psa_algorithm_t {0}_priv_key_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);\n",
+            ctx.filename
+        );
+        file.write(pub_key_alg_fmt.as_bytes()).unwrap();
+    }
+
+    match Any::from_der(priv_key_info.private_key.as_ref()) {
+        Ok((_, any)) => {
+            print_der_any(any, 2, &ctx);
+        }
+        Err(e) => panic!("Error {:?}", e),
+    }
+}
+
 fn write_x509_info(cert_name: &str, x509: &X509Certificate, cert_buf: &[u8], tbs_buf: &[u8]) {
     let new_line_fmt = format!("\n");
     let mut file = File::create(format!("{cert_name}.h")).unwrap();
@@ -127,7 +282,8 @@ fn write_x509_info(cert_name: &str, x509: &X509Certificate, cert_buf: &[u8], tbs
 
     let includes_fmt = format!(
         "#include <stdint.h>\n\
-         #include <stddef.h>\n\n"
+         #include <stddef.h>\n\
+         #include <psa/crypto.h>\n\n"
     );
     file.write(includes_fmt.as_bytes()).unwrap();
 
@@ -167,8 +323,9 @@ fn write_x509_info(cert_name: &str, x509: &X509Certificate, cert_buf: &[u8], tbs
     if oid!(1.2.840 .10045 .4 .3 .2) == *oid {
         let sign_alg_fmt = format!("/* signatureAlgorithm. */\n");
         file.write(sign_alg_fmt.as_bytes()).unwrap();
-        let sig_fmt =
-            format!("const size_t {cert_name}_sign_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);\n");
+        let sig_fmt = format!(
+            "const psa_algorithm_t {cert_name}_sign_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);\n"
+        );
         file.write(sig_fmt.as_bytes()).unwrap();
         file.write(new_line_fmt.as_bytes()).unwrap();
     }
@@ -399,8 +556,9 @@ fn write_x509_info(cert_name: &str, x509: &X509Certificate, cert_buf: &[u8], tbs
         let pub_key_fmt = format!("/* Subject Public Key Info - Algorithm. */");
         file.write(pub_key_fmt.as_bytes()).unwrap();
         file.write(new_line_fmt.as_bytes()).unwrap();
-        let pub_key_alg_fmt =
-            format!("const size_t {cert_name}_pub_key_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);\n");
+        let pub_key_alg_fmt: String = format!(
+            "const psa_algorithm_t {cert_name}_pub_key_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);\n"
+        );
         file.write(pub_key_alg_fmt.as_bytes()).unwrap();
     }
 
@@ -408,7 +566,7 @@ fn write_x509_info(cert_name: &str, x509: &X509Certificate, cert_buf: &[u8], tbs
         let oid = params.as_oid().unwrap();
 
         if oid!(1.2.840 .10045 .3 .1 .7) == oid {
-            let pub_key_alg_family_fmt = format!("const size_t {cert_name}_pub_key_alg_family = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1);\n");
+            let pub_key_alg_family_fmt = format!("const psa_key_type_t {cert_name}_pub_key_alg_family = PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1);\n");
             file.write(pub_key_alg_family_fmt.as_bytes()).unwrap();
         }
     }
