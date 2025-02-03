@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 asn1-rs = "0.6.2"
 clap = { version = "4.5.26", features = ["cargo"] }
+colorized = "1.0.0"
 convert_case = "0.7.1"
 oid-registry = "0.7.1"
 pem = "3.0.4"
